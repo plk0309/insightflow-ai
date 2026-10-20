@@ -9,6 +9,11 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEBUG: bool = False
 
+    DATABASE_URL: str = (
+        "postgresql+psycopg://insightflow:password"
+        "@127.0.0.1:5433/insightflow"
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
