@@ -6,6 +6,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.schema_discovery import (
+    SchemaDiscoveryError,
+    discover_postgres_schema,
+)
 from app.core.encryption import decrypt_credential
 from app.core.postgres_connection import (
     PostgreSQLConnectionError,
@@ -381,4 +385,90 @@ def test_data_source_connection(
         "message": "Database connection verified successfully",
         "data_source_id": str(data_source.id),
         "connected": True,
+    }
+# --------------------------------------------------
+# DISCOVER POSTGRESQL DATABASE SCHEMA
+# GET /api/v1/organizations/{organization_id}/data-sources/{data_source_id}/schema
+# --------------------------------------------------
+
+@router.get("/{data_source_id}/schema")
+def get_data_source_schema(
+    organization_id: UUID,
+    data_source_id: UUID,
+    db: Session = Depends(get_db),
+    membership: OrganizationMembership = Depends(
+        require_organization_role(
+            "owner",
+            "admin",
+            "member",
+            "viewer",
+        )
+    ),
+):
+    # Verify the data source belongs to this organization.
+    data_source = db.scalar(
+        select(DataSource).where(
+            DataSource.id == data_source_id,
+            DataSource.organization_id == organization_id,
+        )
+    )
+
+    if data_source is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Data source not found",
+        )
+
+    if data_source.source_type != "postgresql":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported data source type",
+        )
+
+    # Retrieve credentials for this verified data source.
+    credential = db.scalar(
+        select(DataSourceCredential).where(
+            DataSourceCredential.data_source_id == data_source.id
+        )
+    )
+
+    if credential is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Data source credentials are not configured",
+        )
+
+    try:
+        password = decrypt_credential(
+            credential.encrypted_password
+        )
+
+        # The connection adapter validates the destination,
+        # pins its resolved IP, and requires verified TLS.
+        with secure_postgres_connection(
+            host=credential.host,
+            port=credential.port,
+            database_name=credential.database_name,
+            username=credential.username,
+            password=password,
+        ) as connection:
+            schema = discover_postgres_schema(connection)
+
+    except (PostgreSQLConnectionError, SchemaDiscoveryError):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to discover database schema",
+        ) from None
+
+    except Exception:
+        # Never expose credentials or database internals.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Schema discovery failed",
+        ) from None
+
+    return {
+        "data_source_id": str(data_source.id),
+        "table_count": schema["table_count"],
+        "tables": schema["tables"],
     }
