@@ -5,7 +5,15 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
+from app.core.query_execution import (
+    QueryExecutionError,
+    execute_read_only_query,
+)
+from app.core.query_security import (
+    UnsafeQueryError,
+    validate_read_only_query,
+)
+from app.schemas.query import QueryExecuteRequest
 from app.core.schema_discovery import (
     SchemaDiscoveryError,
     discover_postgres_schema,
@@ -471,4 +479,105 @@ def get_data_source_schema(
         "data_source_id": str(data_source.id),
         "table_count": schema["table_count"],
         "tables": schema["tables"],
+    }
+
+# --------------------------------------------------
+# EXECUTE READ-ONLY SQL QUERY
+# POST /api/v1/organizations/{organization_id}/data-sources/{data_source_id}/query
+# --------------------------------------------------
+
+@router.post("/{data_source_id}/query")
+def execute_data_source_query(
+    organization_id: UUID,
+    data_source_id: UUID,
+    payload: QueryExecuteRequest,
+    db: Session = Depends(get_db),
+    membership: OrganizationMembership = Depends(
+        require_organization_role(
+            "owner",
+            "admin",
+            "member",
+        )
+    ),
+):
+    # Validate SQL before accessing credentials or opening
+    # an external database connection.
+    try:
+        validated_sql = validate_read_only_query(payload.sql)
+    except UnsafeQueryError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="SQL query is not permitted",
+        ) from None
+
+    # Enforce organization-level data source isolation.
+    data_source = db.scalar(
+        select(DataSource).where(
+            DataSource.id == data_source_id,
+            DataSource.organization_id == organization_id,
+        )
+    )
+
+    if data_source is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Data source not found",
+        )
+
+    if data_source.source_type != "postgresql":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported data source type",
+        )
+
+    credential = db.scalar(
+        select(DataSourceCredential).where(
+            DataSourceCredential.data_source_id == data_source.id
+        )
+    )
+
+    if credential is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Data source credentials are not configured",
+        )
+
+    try:
+        password = decrypt_credential(
+            credential.encrypted_password
+        )
+
+        with secure_postgres_connection(
+            host=credential.host,
+            port=credential.port,
+            database_name=credential.database_name,
+            username=credential.username,
+            password=password,
+        ) as connection:
+            result = execute_read_only_query(
+                connection,
+                validated_sql,
+            )
+
+    except PostgreSQLConnectionError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Secure database connection failed",
+        ) from None
+
+    except QueryExecutionError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Database query could not be executed",
+        ) from None
+
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Query execution failed",
+        ) from None
+
+    return {
+        "data_source_id": str(data_source.id),
+        **result,
     }
