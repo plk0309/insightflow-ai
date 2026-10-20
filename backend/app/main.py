@@ -5,6 +5,8 @@ from app.core.config import get_settings
 from app.api.auth import router as auth_router
 from app.api.organizations import router as organizations_router
 
+from app.api.datasources import router as datasources_router
+
 
 def create_app() -> FastAPI:
     settings = get_settings()
@@ -24,6 +26,10 @@ def create_app() -> FastAPI:
     app.include_router(
     organizations_router,
     prefix="/api/v1/organizations",
+)
+    app.include_router(
+    datasources_router,
+    prefix="/api/v1/organizations/{organization_id}/data-sources",
 )
 
     @app.get("/", tags=["Root"])
